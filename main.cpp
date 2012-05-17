@@ -22,6 +22,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
+#include <time.h>
 
 //  These includes are for the serial port reading/writing
 #include <unistd.h>
@@ -30,14 +31,15 @@
 
 using namespace std;
 
-//   Crap for talking to the Serial Port 
-#define FALSE 0;
-volatile int STOP = FALSE;
-unsigned char buf[255];
-int res;
-int myCount=0;
-int maxCount=10000;		// Number of cycles to time out serial port
-
+//   Junk for talking to the Serial Port 
+int serial_fd;
+const int MAX_BUFFER = 100;
+char serial_buffer[MAX_BUFFER];
+int serial_buffer_pos = 0;
+int serial_on = 1;                  //  Are we using serial port for I/O
+int ping_test = 1; 
+double ping = 0; 
+clock_t begin_ping, end_ping;
 
 
 #define WIDTH 1000					//  Width,Height of simulation area in cells
@@ -56,11 +58,15 @@ int mouse_x, mouse_y;				//  Where is the mouse
 int mouse_pressed = 0;				//  true if mouse has been pressed (clear when finished)
 
 float dot_x, dot_y;
+int accel_x, accel_y;
+
+int corners[4];                     //  Measured weights on corner
+int first_measurement = 1;
 
 int framecount = 0;
 
 //  For accessing the serial port 
-void init_port(int *fd, unsigned int baud)
+void init_port(int *fd, int baud)
 {
     struct termios options;
     tcgetattr(*fd,&options);
@@ -74,6 +80,9 @@ void init_port(int *fd, unsigned int baud)
 			break;
 		case 38400: cfsetispeed(&options,B38400);
 			cfsetospeed(&options,B38400);
+			break;
+		case 115200: cfsetispeed(&options,B115200);
+			cfsetospeed(&options,B115200);
 			break;
 		default:cfsetispeed(&options,B9600);
 			cfsetospeed(&options,B9600);
@@ -99,12 +108,26 @@ void output(int x, int y, char *string)
 	}
 }
 
+double diffclock(clock_t clock1,clock_t clock2)
+{
+	double diffticks=clock1-clock2;
+	double diffms=(diffticks*10)/CLOCKS_PER_SEC;
+	return diffms;
+}
+
 void Timer(int extra)
 {
 	char title[100];
-	sprintf(title, "FPS = %i", framecount);
+	sprintf(title, "FPS = %i, ping(msec) = %4.4f", framecount, ping);
 	glutSetWindowTitle(title);
 	framecount = 0;
+    if (serial_on && ping_test)
+    {
+        char buf[] = "ping";
+        write(serial_fd,buf,4);
+        write(serial_fd, "\r", 1);
+        begin_ping = clock();
+    }
 	glutTimerFunc(1000,Timer,0);
 }
 
@@ -114,7 +137,16 @@ void display_stats(void)
 	glColor3f(1.0f, 1.0f, 1.0f);
     char legend[] = "/ - toggle this display, Q - exit, N - toggle noise, M - toggle map";
 	output(10,15,legend);
-	//output(10,25,"Line 2 of stats!");
+    if (serial_on)
+    {
+        /*char stuff[50];
+        if (bytes_read > 0)
+        {
+            sprintf(stuff, "bytes=%i", bytes_read);
+            output(10,60,stuff);
+        }*/
+        output(100,60,serial_buffer);
+    }
 	char mouse[50];
 	sprintf(mouse, "mouse_x = %i, mouse_y = %i, pressed = %i", mouse_x, mouse_y, mouse_pressed);
 	output(10,35,mouse);
@@ -137,19 +169,29 @@ void init(void)
 
 void update_pos(void)
 {
-    dot_x += (float)(rand()%11) - 5.f;
-    dot_y += (float)(rand()%11) - 5.f;
+    if (noise_on)
+    {
+        dot_x += (float)(rand()%11) - 5.f;
+        dot_y += (float)(rand()%11) - 5.f;
+    }
 }
 
 void display(void)
 {
-    // Draw a single Quad to blend 
+    // Trails - Draw a single Quad to blend instead of clear screen 
     glColor4f(0.f, 0.f, 0.f, 0.01f);
-    glBegin(GL_QUADS);                    // Draw A Quad
-    glVertex2f(0.f, HEIGHT);              // Top Left
-    glVertex2f(WIDTH, HEIGHT);              // Top Right
-    glVertex2f( WIDTH,0.f);              // Bottom Right
-    glVertex2f(0.f,0.f);              // Bottom Left
+    glBegin(GL_QUADS);                    
+    glVertex2f(0.f, HEIGHT);              
+    glVertex2f(WIDTH, HEIGHT);            
+    glVertex2f( WIDTH,0.f);               
+    glVertex2f(0.f,0.f);                  
+    
+    //  But totally clear stats display area
+    glColor4f(0.f, 0.f, 0.f, 1.f);
+    glVertex2f(0.f, HEIGHT/10.f);              
+    glVertex2f(WIDTH, HEIGHT/10.f);              
+    glVertex2f( WIDTH,0.f);              
+    glVertex2f(0.f,0.f);              
     glEnd();    
 
     //glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -166,13 +208,13 @@ void display(void)
     glEnd();
     
     //  Draw a centered red dot for perspective 
-    glPointSize(15.f);
+    glPointSize(10.f);
     glColor4f(1.f, 0.f, 0.f, 1.f);
     glBegin(GL_POINTS);
     glVertex2f(WIDTH/2.f, HEIGHT/2.f);
     glEnd();
     
-    usleep(7000);
+    usleep(1000);
     
    	if (stats_on) display_stats(); 
         
@@ -180,6 +222,37 @@ void display(void)
     framecount++;
 }
 
+// Collect sensor data from serial port 
+void read_sensors(void)
+{
+    if (serial_on)
+    {
+        char bufchar[1];
+        while (read(serial_fd, bufchar, 1) > 0)
+        {
+            serial_buffer[serial_buffer_pos] = bufchar[0];
+            serial_buffer_pos++;
+            //  Have we reached end of a line of input?
+            if ((bufchar[0] == '\n') || (serial_buffer_pos >= MAX_BUFFER))
+            {
+                //  At end - Extract value from string to variables
+                if (serial_buffer[0] != 'p')
+                    scanf(serial_buffer, "%i %i %i %i", corners[0], 
+                                                        corners[1], 
+                                                        corners[2], 
+                                                        corners[3]);
+                //  Clear rest of string for printing onscreen
+                while(serial_buffer_pos++ < MAX_BUFFER) serial_buffer[serial_buffer_pos] = ' ';
+                serial_buffer_pos = 0;
+            }
+            if (bufchar[0] == 'p')
+            {
+                end_ping = clock();
+                ping = diffclock(end_ping,begin_ping);
+            }
+        }
+    }
+}
 void key(unsigned char k, int x, int y)
 {
 	//  Process keypresses 
@@ -193,6 +266,7 @@ void key(unsigned char k, int x, int y)
 void idle(void)
 {
     if (!step_on) glutPostRedisplay();
+    read_sensors();
     update_pos(); 
 }
 
@@ -232,15 +306,18 @@ void motionFunc( int x, int y)
 int main(int argc, char** argv)
 {
     //  Try to setup the serial port I/O 
-    int fd;
-	fd = open("/dev/tty.usbmodem411", O_RDWR | O_NOCTTY | O_NDELAY); // List usbSerial devices using Terminal ls /dev/tty.*
+    if (serial_on)
+    {
+        serial_fd = open("/dev/tty.usbmodem411", O_RDWR | O_NOCTTY | O_NDELAY); // List usbSerial devices using Terminal ls /dev/tty.*
     
-    /*
-    if(fd == -1) {				// Check for port errors
-		cout << fd;
-		perror("Unable to open serial port\n");
-		return (0);
-	}*/
+    
+        if(serial_fd == -1) {				// Check for port errors
+            cout << serial_fd;
+            perror("Unable to open serial port\n");
+            return (0);
+        }
+        else init_port(&serial_fd, 115200);        
+    }
 
     glutInit(&argc, argv);
     
@@ -265,7 +342,7 @@ int main(int argc, char** argv)
     glutMainLoop();
     
     // Close serial port
-    close(fd);
+    close(serial_fd);
     
     return EXIT_SUCCESS;
 }
