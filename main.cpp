@@ -22,7 +22,7 @@
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
-#include <time.h>
+#include <sys/time.h>
 
 //  These includes are for the serial port reading/writing
 #include <unistd.h>
@@ -36,10 +36,15 @@ int serial_fd;
 const int MAX_BUFFER = 100;
 char serial_buffer[MAX_BUFFER];
 int serial_buffer_pos = 0;
-int serial_on = 1;                  //  Are we using serial port for I/O
+int serial_on = 0;                  //  Are we using serial port for I/O
 int ping_test = 1; 
+int display_ping = 0; 
+
+timeval begin_ping, end_ping;
+double elapsedTime;
+
 double ping = 0; 
-clock_t begin_ping, end_ping;
+//clock_t begin_ping, end_ping;
 
 
 #define WIDTH 1000					//  Width,Height of simulation area in cells
@@ -53,17 +58,24 @@ clock_t begin_ping, end_ping;
 int stats_on = 1;					//  Whether to show onscreen text overlay with stats
 int noise_on = 0;					//  Whether to fire randomly
 int step_on = 0;                    
+int display_levels = 1;
 
 int mouse_x, mouse_y;				//  Where is the mouse 
 int mouse_pressed = 0;				//  true if mouse has been pressed (clear when finished)
 
 float dot_x, dot_y;
 int accel_x, accel_y;
+const float AVG_RATE = 0.0001;
+
+float mag_imbalance = 0.f;
 
 int corners[4];                     //  Measured weights on corner
+float avg_corners[4];
+
 int first_measurement = 1;
 
 int framecount = 0;
+int samplecount = 0;
 
 //  For accessing the serial port 
 void init_port(int *fd, int baud)
@@ -108,25 +120,33 @@ void output(int x, int y, char *string)
 	}
 }
 
-double diffclock(clock_t clock1,clock_t clock2)
+double diffclock(timeval clock1,timeval clock2)
 {
-	double diffticks=clock1-clock2;
-	double diffms=(diffticks*10)/CLOCKS_PER_SEC;
+	double diffms = (clock2.tv_sec - clock1.tv_sec) * 1000.0;
+    diffms += (clock2.tv_usec - clock1.tv_usec) / 1000.0;   // us to ms
+
 	return diffms;
 }
 
 void Timer(int extra)
 {
 	char title[100];
-	sprintf(title, "FPS = %i, ping(msec) = %4.4f", framecount, ping);
+    
+    //gettimeofday(&end_ping, NULL);
+    //ping = diffclock(begin_ping,end_ping);
+
+	sprintf(title, "FPS = %d, samples/sec = %d, ping(msec) = %4.4f", framecount, samplecount, ping);
 	glutSetWindowTitle(title);
 	framecount = 0;
+    samplecount = 1;   
+    
     if (serial_on && ping_test)
     {
         char buf[] = "ping";
         write(serial_fd,buf,4);
         write(serial_fd, "\r", 1);
-        begin_ping = clock();
+        gettimeofday(&begin_ping, NULL);
+        display_ping = 2;
     }
 	glutTimerFunc(1000,Timer,0);
 }
@@ -165,14 +185,48 @@ void init(void)
 {
     dot_x = WIDTH/2.f;
     dot_y = HEIGHT/2.f;
+    avg_corners[0] = avg_corners[1] = avg_corners[2] = avg_corners[3] = 0.f;
 }
 
 void update_pos(void)
+//  Using sampled data, update the onscreen position of the balance point
 {
+    /*
+    const int SPRING_BACK = 0.1f;
     if (noise_on)
     {
         dot_x += (float)(rand()%11) - 5.f;
         dot_y += (float)(rand()%11) - 5.f;
+    }
+    if (samplecount > 0)
+    {
+        dot_x += 0.1f*(corners[0] - last_corners[0]);
+        dot_y += 0.1f*(corners[1] - last_corners[1]);
+    }
+    //  Option to use spring force to pull back toward center always
+    if (SPRING_BACK > 0.f)
+    {
+        dot_x -= (WIDTH/2.f - dot_x)*SPRING_BACK;
+        dot_y -= (HEIGHT/2.f - dot_y)*SPRING_BACK;
+    }
+     */
+    
+    if (noise_on)
+    {
+        if (rand()%100 == 1)
+        {
+            dot_x = rand()%400;  //  += (float)(rand()%11) - 5.f;
+            dot_y =  rand()%500;  // 300;  // += (float)(rand()%11) - 5.f;
+
+            //dot_x = (float)(rand()%1000);  // (float)(rand()%WIDTH);
+            //dot_y = (float)(rand()%1000);  //200;  //(float)(rand()%HEIGHT);
+        }
+    }
+    else {
+        dot_x = WIDTH/2.f - (((corners[0] - avg_corners[0]) - (corners[1]-avg_corners[1])) + 
+                             ((corners[2] - avg_corners[2]) - (corners[3]-avg_corners[3])))*1.f;
+        dot_y = HEIGHT/2.f - (((corners[2]- avg_corners[2]) - (corners[0] - avg_corners[0])) + 
+                              ((corners[3]- avg_corners[3]) - (corners[1]- avg_corners[1])))*1.f;
     }
 }
 
@@ -213,8 +267,38 @@ void display(void)
     glBegin(GL_POINTS);
     glVertex2f(WIDTH/2.f, HEIGHT/2.f);
     glEnd();
-    
-    usleep(1000);
+
+    if (display_ping)
+    {
+        //  Draw a green dot to indicate receipt of ping signal 
+        glPointSize(30.f);
+        if (display_ping == 2)
+            glColor4f(1.f, 0.f, 0.f, 1.f);
+        else 
+            glColor4f(0.f, 1.f, 0.f, 1.f);
+        glBegin(GL_POINTS);
+        glVertex2f(50, 400);
+        glEnd();
+        display_ping = 0;
+    }
+    if (display_levels)
+    {
+        glColor4f(1.f, 1.f, 1.f, 1.f);
+        glBegin(GL_LINES);
+        glVertex2f(10, HEIGHT*0.95);
+        glVertex2f(10, HEIGHT*(0.25 + 0.75f*corners[0]/4096));
+        
+        glVertex2f(20, HEIGHT*0.95);
+        glVertex2f(20, HEIGHT*(0.25 + 0.75f*corners[1]/4096));
+        
+        glVertex2f(30, HEIGHT*0.95);
+        glVertex2f(30, HEIGHT*(0.25 + 0.75f*corners[2]/4096));
+        
+        glVertex2f(40, HEIGHT*0.95);
+        glVertex2f(40, HEIGHT*(0.25 + 0.75f*corners[3]/4096));
+        glEnd();
+        
+    }
     
    	if (stats_on) display_stats(); 
         
@@ -237,18 +321,33 @@ void read_sensors(void)
             {
                 //  At end - Extract value from string to variables
                 if (serial_buffer[0] != 'p')
-                    scanf(serial_buffer, "%i %i %i %i", corners[0], 
-                                                        corners[1], 
-                                                        corners[2], 
-                                                        corners[3]);
+                {
+                    samplecount++;
+                    sscanf(serial_buffer, "%d %d %d %d", &corners[0], 
+                                                        &corners[1], 
+                                                        &corners[2], 
+                                                        &corners[3]);
+                    for (int i = 0; i < 4; i++)
+                    {
+                        if (!first_measurement)
+                            avg_corners[i] = (1.f - AVG_RATE)*avg_corners[i] + 
+                                            AVG_RATE*(float)corners[i];
+                        else
+                        {
+                            avg_corners[i] = (float)corners[i];
+                        }
+                    }
+                    first_measurement = 0;
+                }
                 //  Clear rest of string for printing onscreen
                 while(serial_buffer_pos++ < MAX_BUFFER) serial_buffer[serial_buffer_pos] = ' ';
                 serial_buffer_pos = 0;
             }
             if (bufchar[0] == 'p')
             {
-                end_ping = clock();
-                ping = diffclock(end_ping,begin_ping);
+                gettimeofday(&end_ping, NULL);
+                ping = diffclock(begin_ping,end_ping);
+                display_ping = 1; 
             }
         }
     }
@@ -268,6 +367,8 @@ void idle(void)
     if (!step_on) glutPostRedisplay();
     read_sensors();
     update_pos(); 
+    usleep(5000);
+
 }
 
 void reshape(int width, int height)
